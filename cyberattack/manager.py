@@ -2,14 +2,32 @@ from typing import Optional, List, Tuple
 import random
 import hashlib
 from dataclass.cyber import CyberAttack, CyberScenario
-
+import os
+# cryptography imports
+from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.exceptions import InvalidSignature
+from dataclass.config import DefenseSystemConfig
+from .spoof import CommandSpoofer
 # ============================================================================ 
-# CYBER ATTACK MANAGER (updated)
+# CYBER ATTACK MANAGER (Ed25519-aware)
 # ============================================================================ 
 class CyberAttackManager:
-    def __init__(self, scenarios: List[CyberScenario], base_error_rate: float):
+    def __init__(self, scenarios: List[CyberScenario], base_error_rate: float, defense_config:DefenseSystemConfig ):
         self.scenarios = scenarios
+        self.defense_config = defense_config
         self.base_error_rate = base_error_rate
+        # public key will be set by simulator (satellite verifies with this)
+        self.public_key = None
+
+    def set_public_key(self, public_key_bytes: bytes):
+        """
+        Supply the Ed25519 public key bytes (Raw) so verify_command can verify signatures.
+        Call from simulator after generating the fresh keypair each run.
+        """
+        try:
+            self.public_key = ed25519.Ed25519PublicKey.from_public_bytes(public_key_bytes)
+        except Exception:
+            self.public_key = None
 
     def get_active_attack(self, current_time: float) -> Optional[CyberScenario]:
         for scenario in self.scenarios:
@@ -17,82 +35,25 @@ class CyberAttackManager:
                 return scenario
         return None
 
-    def apply_attack(self, attack: CyberScenario, current_time: float, commands: List[str],
-                    telemetry_data: dict) -> Tuple[List[str], dict, float]:
+    def apply_attack(self, attack: CyberScenario, current_time: float, commands: List[dict],
+                    telemetry_data: dict, signer_private_key: Optional[ed25519.Ed25519PrivateKey] = None
+                    ) -> Tuple[List[dict], dict, float]:
+        """
+        commands: List of dicts like {"command": "...|md5", "auth": "ed25519", "signature": "<hex>"}
+        If signer_private_key is provided and attack simulates key compromise (attack.has_compromised_key),
+        the manager can use the real private key to sign spoofed commands.
+        """
         if current_time < attack.start_time or current_time > attack.start_time + attack.duration:
             return commands, telemetry_data, self.base_error_rate
 
-        modified_commands = list(commands)  # copy
+        modified_commands = list(commands)  # copy of dicts
         modified_telemetry = telemetry_data.copy()
         error_rate = self.base_error_rate
 
-        # --- COMMAND SPOOFING (enhanced) ---
+        # --- COMMAND SPOOFING (enhanced, produces dicts) ---
         if attack.attack_type == CyberAttack.COMMAND_SPOOFING:
-            # helper to create a spoofed command matching your format
-            def make_spoofed_cmd(cmd_type: str) -> str:
-                if cmd_type.startswith("THRUST"):
-                    # 70% subtle, 30% large bogus (matches examples you posted)
-                    if random.random() < 0.7:
-                        val = random.uniform(-0.01, 0.01)
-                    else:
-                        val = random.uniform(-2000, 2000)
-                elif cmd_type.startswith("RW_TORQUE"):
-                    val = random.uniform(-0.01, 0.01)
-                else:
-                    val = random.uniform(-1, 1)
-                cmd_body = f"{cmd_type}:{val:.6f}"
-                checksum = hashlib.md5(cmd_body.encode()).hexdigest()[:6]
-                return f"{cmd_body}|{checksum}"
-
-            # how many spoofed commands to produce
-            num_to_generate = int(len(commands) * attack.intensity)
-            if attack.intensity > 0 and num_to_generate == 0:
-                num_to_generate = 1  # at least 1 when intensity > 0
-
-            # allowed types to spoof
-            allowed_cmd_types = ['THRUST_X', 'THRUST_Y', 'THRUST_Z',
-                                 'RW_TORQUE_X', 'RW_TORQUE_Y', 'RW_TORQUE_Z']
-
-            # choose mode: insert (default) or replace (set attack.spoof_mode = 'replace')
-            mode = getattr(attack, 'spoof_mode', 'insert')
-
-            if mode == 'insert':
-                for _ in range(num_to_generate):
-                    spoof_type = random.choice(allowed_cmd_types)
-                    spoof_cmd = make_spoofed_cmd(spoof_type)
-                    insert_pos = random.randint(0, len(modified_commands))
-                    modified_commands.insert(insert_pos, spoof_cmd)
-
-            elif mode == 'replace':
-                # replace randomly chosen commands with spoofed ones
-                replace_count = min(num_to_generate, len(modified_commands))
-                replace_indices = random.sample(range(len(modified_commands)), k=replace_count)
-                for idx in replace_indices:
-                    orig = modified_commands[idx]
-                    # try to parse original type (e.g., "THRUST_X:...")
-                    try:
-                        orig_type = orig.split(':', 1)[0]
-                        # 80% keep same type when replacing, otherwise random
-                        if orig_type in allowed_cmd_types and random.random() < 0.8:
-                            spoof_type = orig_type
-                        else:
-                            spoof_type = random.choice(allowed_cmd_types)
-                    except:
-                        spoof_type = random.choice(allowed_cmd_types)
-                    modified_commands[idx] = make_spoofed_cmd(spoof_type)
-
-            else:
-                # fallback: append
-                for _ in range(num_to_generate):
-                    spoof_type = random.choice(allowed_cmd_types)
-                    modified_commands.append(make_spoofed_cmd(spoof_type))
-
-            # optional debug prints
-            if getattr(attack, 'debug', False):
-                print("=== COMMAND SPOOFING DEBUG ===")
-                print("Original:", commands)
-                print("Modified:", modified_commands)
-                print("=============================")
+            spoofer = CommandSpoofer(attack, commands, signer_private_key)
+            modified_commands = spoofer.spoof(commands.copy())
 
         # --- TELEMETRY FALSIFICATION ---
         elif attack.attack_type == CyberAttack.TELEMETRY_FALSIFICATION:
@@ -115,59 +76,96 @@ class CyberAttackManager:
         # --- MALICIOUS DETUMBLE (modify RW_TORQUE commands) ---
         elif attack.attack_type == CyberAttack.MALICIOUS_DETUMBLE:
             for i, cmd in enumerate(modified_commands):
-                if 'RW_TORQUE' in cmd:
-                    parts = cmd.split(':')
-                    if len(parts) >= 2:
-                        try:
+                try:
+                    if 'RW_TORQUE' in cmd.get("command", ""):
+                        parts = cmd["command"].split(':')
+                        if len(parts) >= 2:
                             value = float(parts[1].split('|')[0])
-                            modified_commands[i] = cmd.replace(str(value), str(-value * 1.5))
-                        except:
-                            pass
+                            new_val = str(-value * 1.5)
+                            modified_commands[i]["command"] = cmd["command"].replace(str(value), new_val)
+                            # signature invalid now; if simulating key compromise you might re-sign here
+                except Exception:
+                    pass
 
         # --- ORBIT MANIPULATION (example) ---
         elif attack.attack_type == CyberAttack.ORBIT_MANIPULATION:
             for i in range(int(attack.intensity * 3)):
                 malicious_cmd = f"THRUST_Z:{-0.005:.6f}"
                 checksum = hashlib.md5(malicious_cmd.encode()).hexdigest()[:6]
-                modified_commands.append(f"{malicious_cmd}|{checksum}")
+                cmd_with_md5 = f"{malicious_cmd}|{checksum}"
+                # signed as fake (no real signer) — will fail verify unless compromised
+                sig = os.urandom(16).hex()
+                modified_commands.append({"command": cmd_with_md5, "auth": "ed25519", "signature": sig})
 
         return modified_commands, modified_telemetry, error_rate
 
-    @staticmethod
-    def corrupt_message(msg: str, error_rate: float, flips: int = 2) -> str:
+    def corrupt_message(self, cmd_dict: dict, error_rate: float, flips: int = 2) -> dict:
         """
-        Flip `flips` distinct random bits in the UTF-8 byte representation of msg
-        with probability `error_rate`. If the flips don't change the visible string,
-        perform a single-character fallback corruption to guarantee a visible change.
+        Operates on command dicts. Flips bits in the 'command' string field.
+        Returns a new dict (copy) with possibly corrupted 'command' bytes.
+        Signature field will be left as-is (so verification will fail if we change the command).
         """
-        if random.random() < error_rate and len(msg) > 0:
+        if not isinstance(cmd_dict, dict):
+            return cmd_dict
+
+        out = cmd_dict.copy()
+        if random.random() < error_rate and len(out.get("command", "")) > 0:
+            msg = out["command"]
             byte_array = bytearray(msg.encode('utf-8'))
             total_bits = len(byte_array) * 8
             flips = min(flips, total_bits)
-
-            # choose unique bit indices
             bit_indices = random.sample(range(total_bits), k=flips)
             for bit_index in bit_indices:
                 byte_index = bit_index // 8
                 bit_in_byte = bit_index % 8
                 byte_array[byte_index] ^= (1 << bit_in_byte)
-
             corrupted_msg = byte_array.decode('utf-8', errors='replace')
+            # put corrupted command into dict; signature remains the original => verify should fail
+            out["command"] = corrupted_msg
 
-            # fallback: guarantee visible corruption if nothing changed
-            if corrupted_msg == msg:
+            # fallback guarantee
+            if out["command"] == cmd_dict.get("command"):
                 pos = random.randint(0, len(msg) - 1)
                 corrupted_msg = msg[:pos] + random.choice("XYZ123!@#") + msg[pos + 1:]
+                out["command"] = corrupted_msg
 
-            return corrupted_msg
+        return out
 
-        return msg
+    def verify_command(self, msg: dict) -> Optional[str]:
+        """
+        Verify Ed25519 signature on the given command dict.
+        If valid, returns the command body (text before any '|').
+        If invalid, returns None.
 
-    @staticmethod
-    def verify_command(msg: str) -> Optional[str]:
+        If defense_config.has_enabled_auth is False, signature verification is skipped
+        and the command body is returned (i.e. auth not enforced).
+        """
         try:
-            cmd, checksum = msg.split("|")
-            valid = hashlib.md5(cmd.encode()).hexdigest()[:6]
-            return cmd if valid == checksum else None
-        except:
+            if not isinstance(msg, dict):
+                return None
+
+            cmd_text = msg.get("command", "")
+            signature_hex = msg.get("signature", "")
+            auth = msg.get("auth", "")
+
+            # If defense system explicitly disables auth, accept commands without verification
+            if self.defense_config is not None and not getattr(self.defense_config, "enable_key_auth", True):
+                if '|' in cmd_text:
+                    return cmd_text.split('|', 1)[0]
+                return cmd_text
+
+            # Normal behavior: require ed25519 + public key and verify signature
+            if auth != "ed25519" or not self.public_key:
+                return None
+            signature_bytes = bytes.fromhex(signature_hex)
+            # verify signature against the exact command string the signer signed
+            self.public_key.verify(signature_bytes, cmd_text.encode('utf-8'))
+            # signature valid -> return the command body (before '|') to maintain previous behavior
+            if '|' in cmd_text:
+                return cmd_text.split('|', 1)[0]
+            return cmd_text
+        except (InvalidSignature, ValueError, KeyError):
             return None
+        except Exception:
+            return None
+

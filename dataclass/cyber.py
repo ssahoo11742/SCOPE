@@ -20,3 +20,4 @@ class CyberScenario:
     intensity: float  # 0.0 to 1.0
     debug: bool
     spoof_mode: str
+    has_compromised_key: bool = False

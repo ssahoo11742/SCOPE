@@ -1,5 +1,5 @@
 import numpy as np
-from dataclass.config import SimulationConfig, SatelliteConfig, GroundStationConfig, ControlConfig
+from dataclass.config import SimulationConfig, SatelliteConfig, GroundStationConfig, ControlConfig, DefenseSystemConfig
 from dataclass.cyber import CyberAttack, CyberScenario
 from simulator.sim import SatelliteSimulator
 
@@ -9,10 +9,10 @@ from simulator.sim import SatelliteSimulator
 if __name__ == "__main__":
     # Configure simulation
     sim_config = SimulationConfig(
-        time_steps=10000,
+        time_steps=1000,
         dt=10,
         base_error_rate=0.2,  # Was 0.10 - now only 1% errors
-        log_file="nos3_full_telemetry.csv",
+        log_file="scope_full_telemetry.csv",
         enable_live_plot=False
     )
     
@@ -40,6 +40,10 @@ if __name__ == "__main__":
         frequency_hz=2.2e9
     )
     
+    defense_config = DefenseSystemConfig(
+        enable_key_auth=True
+    )
+    
     control_config = ControlConfig(
         orbit_gain=5e-8,        # Extremely gentle orbit control  
         attitude_gain_p=0.008,   # Very gentle pointing
@@ -50,7 +54,7 @@ if __name__ == "__main__":
     # Define cyber attack scenarios
     cyber_scenarios = [
         CyberScenario(CyberAttack.NONE, 0, 500, 0, debug=False, spoof_mode="insert"),
-        CyberScenario(CyberAttack.COMMAND_SPOOFING, 50000, 30000, 0.7, debug=True, spoof_mode="insert"),
+        CyberScenario(CyberAttack.COMMAND_SPOOFING, 5000, 3000, 0.7, debug=True, spoof_mode="insert", has_compromised_key=False),
         # CyberScenario(CyberAttack.DENIAL_OF_SERVICE, 1200, 200, 0.9),
         # CyberScenario(CyberAttack.BATTERY_DEPLETION, 1000, 400, 0.8),
     ]
@@ -61,6 +65,7 @@ if __name__ == "__main__":
         sat_config=sat_config,
         gs_config=gs_config,
         control_config=control_config,
+        defense_config=defense_config,
         cyber_scenarios=cyber_scenarios,
         initial_altitude=1000
     )

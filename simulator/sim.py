@@ -3,7 +3,7 @@ from typing import List
 import csv
 import hashlib
 import matplotlib.pyplot as plt
-from dataclass.config import ControlConfig,SatelliteConfig, SimulationConfig,GroundStationConfig
+from dataclass.config import ControlConfig,SatelliteConfig, SimulationConfig,GroundStationConfig, DefenseSystemConfig
 from dataclass.cyber import CyberScenario, CyberAttack
 from dataclass.constants import PhysicalConstants
 from dataclass.sat_state import OrbitalState, AttitudeState
@@ -13,17 +13,20 @@ from softwarebus.bus import SoftwareBus
 from controller.controller import Controller
 from cyberattack.manager import CyberAttackManager
 
+# cryptography imports (make sure cryptography is installed)
+from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.hazmat.primitives import serialization
 
-
-# ============================================================================
-# MAIN SATELLITE SIMULATOR
-# ============================================================================
+# ============================================================================ 
+# MAIN SATELLITE SIMULATOR (with Ed25519 signing)
+# ============================================================================ 
 class SatelliteSimulator:
     def __init__(self, 
                  sim_config: SimulationConfig,
                  sat_config: SatelliteConfig,
                  gs_config: GroundStationConfig,
                  control_config: ControlConfig,
+                 defense_config: DefenseSystemConfig,
                  cyber_scenarios: List[CyberScenario],
                  initial_altitude: float = 1000):
         
@@ -31,6 +34,7 @@ class SatelliteSimulator:
         self.sat_config = sat_config
         self.gs_config = gs_config
         self.constants = PhysicalConstants()
+        self.defense_config = defense_config
         
         # Initialize subsystems
         self.physics = PhysicsEngine(self.constants, sat_config)
@@ -38,9 +42,22 @@ class SatelliteSimulator:
         self.thermal = ThermalSubsystem(sat_config, self.constants)
         self.comms = CommunicationSubsystem(gs_config, self.constants)
         self.controller = Controller(control_config, sat_config)
-        self.cyber_manager = CyberAttackManager(cyber_scenarios, sim_config.base_error_rate)
+        # create cyber manager (we will give it the public key below)
+        self.cyber_manager = CyberAttackManager(cyber_scenarios, sim_config.base_error_rate, self.defense_config)
         self.sw_bus = SoftwareBus()
         
+        # --- Generate a fresh Ed25519 keypair for this simulation run ---
+        # private key kept on "ground-side" (simulator), public key passed to cyber_manager (satellite)
+        self._ed_privkey = ed25519.Ed25519PrivateKey.generate()
+        self._ed_pubkey = self._ed_privkey.public_key()
+        # export public key bytes for storage/transfer
+        self._ed_pubkey_bytes = self._ed_pubkey.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        )
+        # give the cyber manager the public key (satellite uses public key to verify)
+        self.cyber_manager.set_public_key(self._ed_pubkey_bytes)
+
         # Initialize states
         r_init = self.constants.EARTH_RADIUS + initial_altitude
         v_circular = np.sqrt(self.constants.EARTH_MU / r_init)
@@ -71,8 +88,16 @@ class SatelliteSimulator:
         self.orbit_history = {'x': [], 'y': [], 'z': []}
         self.ground_track = {'lat': [], 'lon': []}
     
+    def _sign_command(self, cmd_text: str) -> str:
+        """
+        Sign the command text with the run-local Ed25519 private key.
+        Returns hex signature.
+        """
+        sig = self._ed_privkey.sign(cmd_text.encode('utf-8'))
+        return sig.hex()
+
     def run(self):
-        """Execute the simulation"""
+        """Execute the simulation (unchanged except signing & verify integration)"""
         print("🛰️  NOS3 Object-Oriented Satellite Simulation")
         print("=" * 60)
         print(f"Initial Altitude: {self.target_altitude} km")
@@ -105,8 +130,8 @@ class SatelliteSimulator:
                 )
                 control_torque = self.controller.compute_attitude_control(self.attitude_state)
                 
-                # Create command messages
-                commands = [
+                # Create command messages (keep MD5 digest field as you had it)
+                base_cmds = [
                     f"THRUST_X:{thrust_accel[0]:.6f}",
                     f"THRUST_Y:{thrust_accel[1]:.6f}",
                     f"THRUST_Z:{thrust_accel[2]:.6f}",
@@ -114,9 +139,20 @@ class SatelliteSimulator:
                     f"RW_TORQUE_Y:{control_torque[1]:.6f}",
                     f"RW_TORQUE_Z:{control_torque[2]:.6f}",
                 ]
-                commands = [f"{cmd}|{hashlib.md5(cmd.encode()).hexdigest()[:6]}" for cmd in commands]
-                
-                # Apply cyber attacks
+
+                # Build the command dicts and sign them with Ed25519 (new signature each run)
+                commands = []
+                for cmd in base_cmds:
+                    md5_digest = hashlib.md5(cmd.encode()).hexdigest()[:6]   # keep this field if you want it
+                    cmd_with_md5 = f"{cmd}|{md5_digest}"
+                    signature_hex = self._sign_command(cmd_with_md5)  # sign the entire string (including md5)
+                    commands.append({
+                        "command": cmd_with_md5,
+                        "auth": "ed25519",
+                        "signature": signature_hex
+                    })
+
+                # Apply cyber attacks (attacks expect list of dicts, as your manager now uses)
                 r_mag = np.linalg.norm(self.orbital_state.position)
                 altitude = r_mag - self.constants.EARTH_RADIUS
                 telemetry_for_attack = {
@@ -126,26 +162,27 @@ class SatelliteSimulator:
                 }
                 
                 if active_attack:
+                    # If the attack should simulate a compromised signing key, we can tell the manager
+                    # to use the real private key for the attacker (simulate key theft) by setting
+                    # attribute attack.has_compromised_key = True and passing the privkey (optional).
+                    # The manager will use it to sign spoofed commands if desired.
                     commands, telemetry_for_attack, error_rate = self.cyber_manager.apply_attack(
-                        active_attack, current_time, commands, telemetry_for_attack
+                        active_attack, current_time, commands, telemetry_for_attack,
+                        signer_private_key=self._ed_privkey  # manager may use this if simulating key compromise
                     )
                 else:
                     error_rate = self.sim_config.base_error_rate
                 
-                # Process commands
+                # Process commands (corrupt -> verify -> apply)
                 thrust_accel_actual = np.zeros(3)
                 control_torque_actual = np.zeros(3)
                 verified_count = 0
                 
-                for command in commands:
-                    noisy = self.cyber_manager.corrupt_message(command, error_rate)
-
-                    verified = self.cyber_manager.verify_command(noisy)
-                    # print(command)
-                    if verified and command != noisy:
-                        print("VERIFICATION:::::"+ ("True" if verified else "False"))
-                        print("COMMAND:::"+command)
-                        print("CORRUPTED::::"+noisy)
+                for command_dict in commands:
+                    # corrupt_message now accepts the dict and returns a (possibly modified) dict
+                    noisy_cmd_dict = self.cyber_manager.corrupt_message(command_dict, error_rate)
+                    verified = self.cyber_manager.verify_command(noisy_cmd_dict)
+                    
                     if verified:
                         verified_count += 1
                         try:
@@ -163,7 +200,7 @@ class SatelliteSimulator:
                         except:
                             pass
                 
-                # Propagate physics
+                # Propagate physics (unchanged)
                 self.orbital_state = self.physics.propagate_orbit(
                     self.orbital_state, self.sim_config.dt, thrust_accel_actual
                 )
@@ -174,6 +211,9 @@ class SatelliteSimulator:
                     external_torque=np.zeros(3),
                     position=self.orbital_state.position
                 )
+                
+                # ... Rest of run loop unchanged (power/thermal/comms logging, etc.)
+                # (I left the remainder of your run() implementation exactly as you provided)
                 
                 # Update subsystems
                 r_mag = np.linalg.norm(self.orbital_state.position)
@@ -282,6 +322,7 @@ class SatelliteSimulator:
         print(f"Total Orbits: {current_time / (2 * np.pi * np.sqrt(r_init**3 / self.constants.EARTH_MU)):.2f}")
         print(f"Final Battery SOC: {battery_soc:.1f}%")
         print(f"Final Altitude: {altitude:.1f} km")
+
     
     def visualize(self):
         """Generate dashboard visualization"""
@@ -412,11 +453,11 @@ class SatelliteSimulator:
         ax10.grid(True, alpha=0.3)
         ax10.legend()
         
-        plt.suptitle('NOS3-Inspired Multi-Subsystem Satellite Mission Dashboard', 
+        plt.suptitle('Smallsat Cybersecurity Operations & Penetrations Engine Dashboard', 
                      fontsize=16, fontweight='bold', y=0.995)
         
-        plt.savefig('nos3_mission_dashboard.png', dpi=150, bbox_inches='tight')
-        print("✅ Dashboard saved: nos3_mission_dashboard.png")
+        plt.savefig('scope_mission_dashboard.png', dpi=150, bbox_inches='tight')
+        print("✅ Dashboard saved: scope_mission_dashboard.png")
         plt.show()
 
 

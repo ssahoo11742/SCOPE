@@ -31,6 +31,11 @@ class SatelliteConfig:
     absorptivity: float = 0.9
 
 @dataclass
+class DefenseSystemConfig:
+    enable_key_auth: bool = True
+
+
+@dataclass
 class GroundStationConfig:
     """Ground station properties"""
     latitude: float = 34.5  # degrees (Kirtland AFB)
